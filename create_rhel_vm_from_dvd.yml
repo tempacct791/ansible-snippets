@@ -1,0 +1,134 @@
+---
+
+#
+# This playbook creates a new Red Hat Enterprise Linux (RHEL) 8 virtual machine (VM).
+# It uses RHEL8 ISO (DVD install), and unattended install using kickstart file hosted
+# on the LAN.
+# Pre-requisites:
+# - Ansible is installed
+# - The ansible/controller host needs to be able to connect to VMware API on the LAN
+# - The pyvmomi python package is a pre-requisite of running the vmware_* ansible modules.
+#   - On RHEL8, dnf install python3-pyvmomi
+#   - On RHEL7, need to pip install pyvmomi
+# - All the vmware_* modules require setting "delegate_to: localhost", as they are being
+#   run on the controller host (they don't SSH into the host that is being created).
+#
+# Disclaimer: This playbook is a sample. This specific file has not been tested.
+#
+
+- name: Playbook to create RHEL8 VM from DVD
+  hosts: rhel8
+  gather_facts: no
+  any_errors_fatal: yes
+
+  tasks:
+    - name: Get localhost datetime
+      delegate_to: localhost
+      setup:
+        gather_subset: date_time
+        
+    - name: Set vm creation vars
+      set_fact:
+        hostname_to_set: "{{inventory_hostname | lower}}"
+        vm_name_to_set: "{{vm_name | default(inventory_hostname)}}"
+        vm_annotation: "Created by ansible, {{ansible_date_time.date}} {{ansible_date_time.time ~ ' ' ~ ansible_date_time.tz}}"
+        disk_gb_to_set: "{{disk_gb | default(30)}}"
+        vmware_iso_path: "[datastore1] ISOs/rhel-8.3-x86_64-dvd.iso"
+        kickstart_file_url: "https://www-server/pub/kickstart/rhel8/rhel8-ks.cfg"
+        vmware_network_name: VM Network
+        network_mask: 255.255.255.0
+        network_gateway: 192.168.10.1
+        dns_server: 192.168.10.10
+        dns_server_2: 192.168.10.11
+        
+    - name: Invoke VMware API to create RHEL VM booted from DVD
+      delegate_to: localhost
+      vmware_guest:
+        hostname: "{{vmware_cluster}}"
+        username: "{{vmware_username}}"
+        password: "{{vmware_password}}"
+        datacenter: "{{vmware_data_center}}"
+        validate_certs: "{{vmware_validate_certs | default('no')}}"
+        folder: "{{vmware_folder}}"
+        guest_id: "rhel8_64Guest"
+        annotation: "{{vm_annotation}}"
+        name: "{{vm_name_to_set}}"
+        hardware:
+          memory_mb: "{{mem_mb | default(4096)}}"
+          num_cpus: "{{vcpu | default(2)}}"
+          num_cpu_cores_per_socket: "{{cores_per_vcpu | default(1)}}"
+        disk:
+          - size_gb: "{{disk_gb_to_set}}"
+            type: thin
+            datastore: "{{vmware_datastore_vm}}"
+        cdrom:
+          - controller_number: 0
+            unit_number: 0
+            state: present
+            type: iso
+            iso_path: "{{vmware_iso_path}}"
+        networks:
+          - name: "{{vmware_network_name}}"
+            type: static
+            start_connected: yes
+            allow_guest_control: yes
+            ip: "{{ansible_host}}"
+            netmask: "{{network_mask}}"
+            gateway: "{{network_gateway}}"
+        state: poweredon
+        
+    - name: Set anaconda_boot_options vars
+      set_fact:
+        anaconda_boot_options: >-
+          vmlinuz initrd=initrd.img inst.ks={{kickstart_file_url}} inst.noverifyssl
+          ip={{ansible_host}}::{{network_gateway}}:{{network_mask}}:::none
+          nameserver={{dns_server}} nameserver={{dns_server_2}}
+            
+    - name: Press ESC to get the boot options prompt, and then type in the boot options
+      delegate_to: localhost
+      vmware_guest_sendkey:
+        hostname: "{{vmware_cluster}}"
+        username: "{{vmware_username}}"
+        password: "{{vmware_password}}"
+        datacenter: "{{vmware_data_center}}"
+        validate_certs: "{{vmware_validate_certs | default('no')}}"
+        name: "{{vm_name_to_set}}"
+        keys_send:
+          - ESC
+          - ESC
+        string_send: "{{anaconda_boot_options}}"
+
+    - name: Press ENTER to start installation with boot options
+      delegate_to: localhost
+      vmware_guest_sendkey:
+        hostname: "{{vmware_cluster}}"
+        username: "{{vmware_username}}"
+        password: "{{vmware_password}}"
+        datacenter: "{{vmware_data_center}}"
+        validate_certs: "{{vmware_validate_certs | default('no')}}"
+        name: "{{vm_name_to_set}}"
+        keys_send:
+          - ENTER
+    
+    # here, RHEL is installing, followed by a reboot.
+    
+    - name: Remove the SSH known_hosts entry (as the VM was rebuilt)
+      delegate_to: localhost
+      lineinfile:
+        path: ~/.ssh/known_hosts
+        regex: "^{{ansible_host}}\\s"
+        state: absent
+        mode: '0600'
+    # the module below has a race condition when run against multiple hosts. it seems to create an intermediate file ~/.ssh/known_hosts.old
+    #  known_hosts:
+    #    name: "{{ansible_host}}"
+    #    state: absent
+    
+    # give it 10 mins max
+    - name: Wait for RHEM VM to install and reboot
+      wait_for_connection:
+        delay: 45
+        sleep: 15
+        timeout: 600
+        
+    # other tasks here...
